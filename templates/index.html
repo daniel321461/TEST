@@ -536,6 +536,25 @@ const EMPTY_STATE = {
   level_history:[], xp_event_ids:[], level_pending:0
 };
 
+// Defensive normalization: saved and model-generated collections may have unexpected types.
+function safeList(value) { return Array.isArray(value) ? value : []; }
+function hasCharacterProfile(value) {
+  if (!value || !value.name || value.name === 'Пустой' || !value.race || !value.class) return false;
+  const st = value.stats;
+  const full = st && ['str','dex','con','int','wis','cha'].every(k =>
+    Number.isInteger(st[k]) && st[k] > 0 && st[k] <= 30);
+  return Boolean(full && (Object.values(st).some(v => v !== 10) ||
+    safeList(value.skills).length || safeList(value.abilities).length));
+}
+function allowPartialSheet(value) {
+  // Even a failed extraction must never permanently block the player's character sheet.
+  if (value && value.character_setup_pending && hasCharacterProfile(value)) {
+    value.character_setup_pending = false;
+    value.character_ready = true;
+  }
+  return value;
+}
+
 const NOTE_TYPES = {
   note:         { icon: '📝', label: 'Заметка' },
   letter:       { icon: '✉',  label: 'Письмо' },
@@ -787,6 +806,7 @@ function startCharacterGame(character, world, scene) {
   messages = [];
   state = {...EMPTY_STATE, ...character, character_setup_pending: true};
   resetSession();
+  persist(); // The old campaign must not return after a failed first model request.
   ttsStop();
   tts.lastText = '';
   chatEl.innerHTML = '';
@@ -1208,10 +1228,12 @@ async function updateState(turnId) {
       const creating = Boolean(state.character_setup_pending);
       if (creating) {
         for (const key of ['name', 'race', 'class', 'background']) updated[key] = state[key];
-        if (!updated.state_update_warning) delete updated.character_setup_pending;
+        if (!updated.state_update_warning || hasCharacterProfile(updated)) {
+          delete updated.character_setup_pending;
+        }
       }
-      state = updated;
-      state.character_ready = !state.state_update_warning;
+      state = allowPartialSheet(updated);
+      state.character_ready = hasCharacterProfile(state) || !state.state_update_warning;
       if (state.state_update_warning) addMsg('system', '⚠ Модель не смогла разобрать изменения последнего хода. Рассказ сохранён, но лист персонажа мог не обновиться. Проверьте инвентарь и ресурсы.');
       if (Number(state.level || 1) > oldLevel) {
         const gained = Number(state.level) - oldLevel;
@@ -1312,24 +1334,29 @@ async function doRoll(expr) {
 /* SHEET */
 async function doSheet() {
   if (!state) return;
-  if (state.character_setup_pending) {
-    modalContent.innerHTML = '<h3>📜 Лист героя</h3><p>Характеристики ещё формируются. Дождитесь обновления листа после первого ответа мастера.</p>' +
-      `<button class="btn primary" onclick="document.getElementById('modal').classList.remove('open')">Закрыть</button>`;
-    modalEl.classList.add('open');
-    return;
+  const stillPendingBefore = Boolean(state.character_setup_pending);
+  allowPartialSheet(state);
+  if (stillPendingBefore && !state.character_setup_pending) {
+    persist();
+    renderStatus();
   }
-  const s = state.stats || {};
-  const quests = (Array.isArray(state.quests) ? state.quests : []).map(q => {
+  const pendingNotice = state.character_setup_pending
+    ? '⏳ Характеристики ещё формируются; ниже показаны доступные данные. Если они неполные, попробуйте ещё один ход.'
+    : state.state_update_warning
+    ? '⚠ Последнее обновление листа завершилось с ошибкой: некоторые значения могли не сохраниться.'
+    : '';
+  const s = state.stats && typeof state.stats === 'object' ? state.stats : {};
+  const quests = safeList(state.quests).map(q => {
     if (typeof q === 'string') {
       return { id: 'old-' + q, name: q, type: 'side', status: 'active',
                chain: '', chain_order: 0, stages: [], current_stage: 0,
                rewards: {}, giver: '', location: '' };
     }
-    return q;
-  });
+    return q && typeof q === 'object' ? q : null;
+  }).filter(Boolean);
 
-  const inv = (state.inventory || []).length
-    ? state.inventory.map(item => {
+  const inv = safeList(state.inventory).length
+    ? safeList(state.inventory).map(item => {
         const label = typeof item === 'object' && item !== null
           ? item.name || item.title || 'Предмет'
           : item;
@@ -1373,7 +1400,7 @@ async function doSheet() {
       const strike = st.done ? 'text-decoration:line-through;' : '';
       return `<div style="font-size:12px;color:${color};${strike}margin:2px 0">${mark} ${esc(st.text || '')}</div>`;
     }).join('');
-    const rewards = q.rewards && Object.keys(q.rewards).length
+    const rewards = q.rewards && typeof q.rewards === 'object' && Object.keys(q.rewards).length
       ? `<div style="font-size:11px;color:var(--text-secondary);margin-top:4px">
            🎁 ${Array.isArray(q.rewards) ? q.rewards.map(esc).join(', ') : q.rewards.xp ? `+${esc(q.rewards.xp)} XP` : ''}
            ${formatCoins(q.rewards) ? ` · 💰 ${formatCoins(q.rewards)}` : ''}
@@ -1399,8 +1426,8 @@ async function doSheet() {
     ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--text-secondary);font-size:12px">Выполненные (${completedQuests.length})</summary><div style="margin-top:6px">${completedQuests.map(renderQuest).join('')}</div></details>`
     : '';
 
-  const lvlHist = (state.level_history || []).length
-    ? state.level_history.map(h =>
+  const lvlHist = safeList(state.level_history).length
+    ? safeList(state.level_history).filter(h => h && typeof h === 'object').map(h =>
         `<div style="font-size:12px;color:var(--text-secondary);padding:3px 0;border-bottom:1px solid var(--border-subtle)">
           <b style="color:var(--text-primary)">Ур. ${h.level}</b>
           · ${esc(h.hp || '')} HP
@@ -1413,8 +1440,8 @@ async function doSheet() {
   const dc = state.dc_modifier || 0;
   const dcBoxCls = dc > 0 ? 'up' : (dc < 0 ? 'down' : '');
   const dcSign = dc > 0 ? '+' : '';
-  const dcReasons = (state.dc_modifier_reasons || []).length
-    ? state.dc_modifier_reasons.map(r => `<span class="tag warn">${esc(r)}</span>`).join('')
+  const dcReasons = safeList(state.dc_modifier_reasons).length
+    ? safeList(state.dc_modifier_reasons).map(r => `<span class="tag warn">${esc(r)}</span>`).join('')
     : '<span class="tag empty">нет модификаторов</span>';
   const dcBox = `
     <div class="dc-box ${dcBoxCls}">
@@ -1441,11 +1468,12 @@ async function doSheet() {
     return m >= 0 ? '+' + m : '' + m;
   };
 
-  const notesCount = (state.notes || []).length;
-  const notesUnread = (state.notes || []).filter(n => n.unread).length;
+  const notesCount = safeList(state.notes).length;
+  const notesUnread = safeList(state.notes).filter(n => n.unread).length;
 
   modalContent.innerHTML = `
     <h3>📜 ${esc(state.name || 'Пустой')}</h3>
+    ${pendingNotice ? `<p class="sheet-warning" role="status">${esc(pendingNotice)}</p>` : ''}
     ${state.race || state.class ? `<div class="kv"><span class="k">Раса · Класс</span><span class="v">${esc(state.race || '—')} · ${esc(state.class || '—')}</span></div>` : ''}
     ${state.background ? `<div class="kv"><span class="k">Предыстория</span><span class="v">${esc(state.background)}</span></div>` : ''}
     <div class="kv"><span class="k">Уровень</span><span class="v">${state.level}${state.level_pending ? ` · повышение доступно (${state.level_pending})` : ''}</span></div>
@@ -1588,17 +1616,17 @@ async function doNotes() {
 /* SKILLS */
 async function doSkills() {
   if (!state) return;
-  const prof = (state.proficiencies || []).length
-    ? state.proficiencies.map(p => `<span class="tag">${esc(p)}</span>`).join('')
+  const prof = safeList(state.proficiencies).length
+    ? safeList(state.proficiencies).map(p => `<span class="tag">${esc(p)}</span>`).join('')
     : '<span class="tag empty">нет владений</span>';
-  const skills = (state.skills || []).length
-    ? state.skills.map(sk => {
+  const skills = safeList(state.skills).length
+    ? safeList(state.skills).filter(sk => sk && typeof sk === 'object').map(sk => {
         const bonus = sk.bonus >= 0 ? '+' + sk.bonus : '' + sk.bonus;
         return `<span class="tag skill" title="${esc(sk.source || '')}">${esc(sk.name)} ${bonus}</span>`;
       }).join('')
     : '<span class="tag empty">нет навыков</span>';
-  const abilities = (state.abilities || []).length
-    ? state.abilities.map(a => {
+  const abilities = safeList(state.abilities).length
+    ? safeList(state.abilities).filter(a => a && typeof a === 'object').map(a => {
         const isPassive = a.recharge === 'passive' || !a.uses_max;
         const usesText = isPassive ? '∞' : `${a.uses_left ?? a.uses_max}/${a.uses_max}`;
         const isEmpty = !isPassive && (a.uses_left || 0) === 0;
@@ -1788,7 +1816,7 @@ async function doLoad(name) {
     if (!res.ok) throw new Error('не найдено');
     const d = await res.json();
     messages = d.messages || [];
-    state = d.state || {...EMPTY_STATE};
+    state = allowPartialSheet(d.state || {...EMPTY_STATE});
     resetSession();                 // резюме прежней партии больше не актуально
     persist(); renderAll(); renderStatus();
     addMsg('system', `📂 Загружено: «${name}»`);
@@ -1934,7 +1962,17 @@ function doTransfer() {
 }
 
 function doReset() {
-  openCharacterBuilder();
+  const hasHistory = messages.length > 0 || (state && state.name && state.name !== 'Пустой');
+  const warning = hasHistory
+    ? 'Точно начать новую игру?\n\nТекущая история чата и персонаж будут удалены из этого браузера. Сохранения в отдельных слотах останутся доступными.'
+      + ((busy || stateUpdatePromise) ? '\n\nТекущий запрос к мастеру будет прерван.' : '')
+    : 'Начать новую игру и открыть создание персонажа?';
+  if (!confirm(warning)) return;
+  // Clear the old campaign before reloading: init() will not restore the old chat.
+  localStorage.removeItem(LS_KEY);
+  resetSession();
+  sessionStorage.setItem('rpg_open_builder_after_reset', '1');
+  window.location.reload();
 }
 
 function doHelp() {
@@ -2116,7 +2154,7 @@ function init() {
   const saved = restore();
   if (saved && saved.messages.length) {
     messages = saved.messages;
-    state = saved.state || {...EMPTY_STATE};
+    state = allowPartialSheet(saved.state || {...EMPTY_STATE});
     // Совместимость
     if (!Array.isArray(state.relationships)) state.relationships = [];
     if (!Array.isArray(state.faction_clocks)) state.faction_clocks = [];
@@ -2158,6 +2196,11 @@ function init() {
   renderWorlds();
   ttsLoad();
   autosize();
+  if (sessionStorage.getItem('rpg_open_builder_after_reset') === '1') {
+    sessionStorage.removeItem('rpg_open_builder_after_reset');
+    // Open after restoring the page, without sending anything to the model yet.
+    setTimeout(() => openCharacterBuilder(), 0);
+  }
 }
 init();
 refreshPresence();
