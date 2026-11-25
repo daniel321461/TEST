@@ -444,6 +444,7 @@
 
 <script>
 let messages = [], state = null, busy = false;
+let stateUpdatePromise = null;
 const chatEl = document.getElementById('chat');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send-btn');
@@ -527,7 +528,7 @@ const EMPTY_STATE = {
   hp:10, max_hp:10, gold:0, silver:0, copper:0,
   stats:{str:10,dex:10,con:10,int:10,wis:10,cha:10},
   proficiencies:[], skills:[], abilities:[],
-  inventory:[], notes:[], quests:[], conditions:[],
+  inventory:[], notes:[], quests:[], conditions:[], world_facts:[], current_location:'', spells_known:[],
   relationships:[], faction_clocks:[],
   dc_modifier:0, dc_modifier_reasons:[],
   position:"стоит", cover:"нет",
@@ -563,8 +564,48 @@ function restore() {
   } catch(e){}
   return null;
 }
+// ИИ и старые сохранения иногда возвращают не строку, а объект JSON.
+// String(object) показывал игроку бесполезное «[object Object]».
+function readableValue(value, depth = 0) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map(item => readableValue(item, depth + 1))
+      .filter(Boolean).join(', ');
+  }
+  if (typeof value === 'object') {
+    for (const key of ['message', 'error', 'detail', 'reason', 'text', 'title', 'name', 'label', 'content', 'description']) {
+      if (value[key] !== undefined && value[key] !== null) {
+        const result = readableValue(value[key], depth + 1);
+        if (result) return result;
+      }
+    }
+    if (depth >= 3) return 'дополнительные данные';
+    const parts = Object.entries(value).slice(0, 8)
+      .map(([key, item]) => `${key}: ${readableValue(item, depth + 1)}`)
+      .filter(Boolean);
+    return parts.join('; ') || 'нет данных';
+  }
+  return String(value);
+}
 function esc(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  return readableValue(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function responseErrorText(response) {
+  let body = '';
+  try { body = await response.text(); } catch (_) {}
+  if (body) {
+    try {
+      const json = JSON.parse(body);
+      const text = readableValue(json.error ?? json.message ?? json.detail ?? json);
+      if (text) return text.slice(0, 400);
+    } catch (_) {
+      if (!body.trimStart().startsWith('<')) return body.trim().slice(0, 400);
+    }
+  }
+  return `HTTP ${response.status}`;
 }
 
 const CHARACTER_CUSTOM_KEY = 'rpg_character_options_v1';
@@ -597,6 +638,10 @@ function readCharacterOptions() {
 }
 
 function openCharacterBuilder(world = null) {
+  if (stateUpdatePromise) {
+    addMsg('system', '⏳ Дождитесь окончания обновления листа перед созданием другого героя.');
+    return;
+  }
   if (busy || characterDialog.open) return;
   const form = document.getElementById('character-form');
   const stepPanel = document.getElementById('character-step');
@@ -969,7 +1014,7 @@ function renderStatus() {
   if (!state) { statusEl.innerHTML = ''; return; }
   const hpPct = state.max_hp ? Math.max(0, Math.min(100, state.hp / state.max_hp * 100)) : 0;
   const xpPct = state.xp_next ? Math.max(0, Math.min(100, state.xp / state.xp_next * 100)) : 0;
-  const c = (state.conditions || []).length
+  const c = Array.isArray(state.conditions) && state.conditions.length
     ? ' · ' + state.conditions.map(x => `<span style="color:#d45a5a">${esc(x)}</span>`).join(', ')
     : '';
   const dc = state.dc_modifier || 0;
@@ -1017,12 +1062,19 @@ function renderStatus() {
 
 /* CHAT */
 function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
+function renderNarration(text) {
+  // First escape untrusted model text, then apply a small safe Markdown subset.
+  return esc(text).replace(/^&gt;\s?(.*)$/gm, '<blockquote>$1</blockquote>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/(?<!\*)\*([^\n*]+)\*(?!\*)/g, '<em>$1</em>')
+    .replace(/\n/g, '<br>');
+}
 function addMsg(role, text) {
   const d = document.createElement('div');
   d.className = 'msg ' + role;
   if (role === 'master') {
     const textSpan = document.createElement('span');
-    textSpan.textContent = text;
+    textSpan.innerHTML = renderNarration(text);
     d.appendChild(textSpan);
     if (tts.available) {
       const btn = document.createElement('button');
@@ -1037,7 +1089,7 @@ function addMsg(role, text) {
       d.appendChild(btn);
     }
   } else {
-    d.textContent = text;
+    d.textContent = readableValue(text);
   }
   chatEl.appendChild(d);
   scrollBottom();
@@ -1060,6 +1112,10 @@ function setTurnBusy(value) {
 
 async function callAI(pending) {
   setTurnBusy(true);
+  if (stateUpdatePromise) {
+    const waiting = addMsg('system', '⏳ Предыдущий ход ещё обновляет лист героя. Ожидаем синхронизацию…');
+    try { await stateUpdatePromise; } finally { waiting.remove(); }
+  }
   if (tts.speaking) ttsStop();
   const md = document.createElement('div');
   md.className = 'msg master typing-indicator';
@@ -1073,12 +1129,9 @@ async function callAI(pending) {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({messages: [...messages, pending], state})
     });
-    if (res.status === 503) {
-      const problem = await res.json().catch(() => ({}));
-      throw new Error(problem.error || 'Игра временно недоступна.');
-    }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw new Error(await responseErrorText(res));
     turnId = res.headers.get('X-Turn-Id') || '';
+    if (!res.body) throw new Error('Сервер не прислал поток ответа.');
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     md.classList.remove('typing-indicator');
@@ -1101,7 +1154,12 @@ async function callAI(pending) {
     if (tts.enabled && tts.available) {
       setTimeout(() => ttsSpeak(full, finalMsg.querySelector('.speak-btn')), 60);
     }
-    await updateState(turnId);
+    // Narration is ready: unlock the chat while the slower state extraction finishes.
+    const progress = addMsg('system', '⏳ Обновляются характеристики, инвентарь и квесты…');
+    stateUpdatePromise = updateState(turnId).finally(() => {
+      progress.remove();
+      stateUpdatePromise = null;
+    });
   } catch (error) {
     md.remove();
     const isRoll = pending.content.startsWith('[[БРОСОК]]');
@@ -1135,26 +1193,35 @@ async function updateState(turnId) {
   if (!state) state = {...EMPTY_STATE};
   const headers = {'Content-Type': 'application/json'};
   if (turnId) headers['X-Turn-Id'] = turnId;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
   try {
     const res = await fetch('/api/state', {
       method: 'POST', headers,
+      signal: controller.signal,
       body: JSON.stringify({messages, state})
     });
+    if (!res.ok) throw new Error(await responseErrorText(res));
     if (res.ok) {
       const oldLevel = Number(state.level || 1);
       const updated = await res.json();
-      if (state.character_setup_pending) {
+      const creating = Boolean(state.character_setup_pending);
+      if (creating) {
         for (const key of ['name', 'race', 'class', 'background']) updated[key] = state[key];
-        delete updated.character_setup_pending;
+        if (!updated.state_update_warning) delete updated.character_setup_pending;
       }
       state = updated;
+      state.character_ready = !state.state_update_warning;
+      if (state.state_update_warning) addMsg('system', '⚠ Модель не смогла разобрать изменения последнего хода. Рассказ сохранён, но лист персонажа мог не обновиться. Проверьте инвентарь и ресурсы.');
       if (Number(state.level || 1) > oldLevel) {
         const gained = Number(state.level) - oldLevel;
         addMsg('system', `🎉 Доступно повышение уровня: ${state.level} (получено уровней: ${gained}). Обсуди с мастером выбор повышения характеристик и умения.`);
       }
       renderStatus(); persist();
     }
-  } catch(e){}
+  } catch(e) {
+    addMsg('system', '⚠ Лист героя не удалось обновить: ' + (e.name === 'AbortError' ? 'превышено время ожидания (120 с)' : e.message) + '. Ответ мастера сохранён в чате, но изменения инвентаря и ресурсов следует проверить перед следующим ходом.');
+  } finally { clearTimeout(timer); }
 }
 
 /* SEND */
@@ -1186,8 +1253,34 @@ function handleCommand(cmd, arg) {
     default: addMsg('system', `Неизвестная команда: ${cmd}. Введите /help.`);
   }
 }
+function currentPendingRoll() {
+  const last = [...messages].reverse().find(m => m.role === 'assistant');
+  if (!last || typeof last.content !== 'string') return null;
+  const reply = last.content;
+  const formula = [...reply.matchAll(/\/roll\s+((?:\d*)d\d+(?:(?:kh|kl)\d+)?(?:[+-]\d+)?)/gi)].at(-1);
+  if (!formula) return null;
+  const before = reply.slice(Math.max(0, formula.index - 240), formula.index);
+  const dcMatches = [...before.matchAll(/(?:\bDC\b|КС|сложность)\s*[:=—-]?\s*(\d+)/gi)];
+  const dc = dcMatches.at(-1);
+  if (!dc) return null; // A free roll cannot advance the story.
+  const skill = before.match(/(?:проверка|спасбросок|атака)\s+([А-Яа-яЁё\s]{3,35}?)(?:[,.:]|\s+DC|\s+КС)/i);
+  return {expr: formula[1], dc: Number(dc[1]), skill: skill ? skill[1].trim() : 'проверка'};
+}
+function drawDiceCard(d) {
+  const mod = d.mod ? (d.mod > 0 ? '+' + d.mod : String(d.mod)) : '';
+  const kept = d.kept ? ` → учтены [${d.kept.join(', ')}]` : '';
+  const details = `[${d.rolls.join(', ')}]${kept}${mod} = ${d.total}`;
+  addHtmlMsg('dice', `🎲 <b>${esc(d.expr)}</b> → ${esc(details)}`);
+  return details;
+}
 async function doRoll(expr) {
   if (busy || !gameAccess) return;
+  const check = currentPendingRoll();
+  if (check && expr.trim().toLowerCase() === '1d20') expr = check.expr;
+  if (check && expr.replace(/\s+/g,'').toLowerCase() !== check.expr.replace(/\s+/g,'').toLowerCase()) {
+    addMsg('system', `Мастер ждёт ${check.expr} (сложность ${check.dc}). Для другого броска сначала завершите эту проверку.`);
+    return;
+  }
   setTurnBusy(true);
   const animDiv = addHtmlMsg('dice',
     `<span class="dice-emoji">🎲</span> Бросок ${esc(expr)}...`);
@@ -1199,13 +1292,16 @@ async function doRoll(expr) {
       body: JSON.stringify({expr})
     });
     const d = await res.json();
-    if (d.error) { addMsg('system', 'Ошибка броска: ' + d.error); return; }
-    const m = d.mod ? (d.mod > 0 ? '+' + d.mod : '' + d.mod) : '';
-    const kept = d.kept ? ` → учтены [${d.kept.join(', ')}]` : '';
-    const result = `[${d.rolls.join(', ')}]${kept}${m} = ${d.total}`;
-    addHtmlMsg('dice', `🎲 <b>${esc(d.expr)}</b> → ${esc(result)}`);
+    if (d.error) { addMsg('system', 'Ошибка броска: ' + readableValue(d.error)); return; }
+    const result = drawDiceCard(d);
+    messages.push({role: 'dice', content: {expr: d.expr, rolls: d.rolls, kept: d.kept || null, mod: d.mod, total: d.total}});
+    persist();
+    if (!check) {
+      addMsg('system', 'Свободный бросок: результат записан, но не влияет на сюжет. Для проверки сначала опишите действие героя.');
+      return;
+    }
     await callAI({role: 'user', content:
-      `[[БРОСОК]] ${d.expr} → ${result}. Используй этот итог. Сравни с объявленной сложностью только для проверок, атак и спасбросков. Опиши последствия. Не решай за игрока.`});
+      `[[БРОСОК]] Проверка ${check.skill}; сложность ${check.dc}; ${d.expr} → ${result}. Итог ${d.total}. Применяй только эту проверку к ранее объявленному действию. Не прибавляй модификатор повторно. Не переноси результат на другое действие.`});
   } catch(e) {
     addMsg('system', 'Ошибка: ' + e.message);
   } finally {
@@ -1216,8 +1312,14 @@ async function doRoll(expr) {
 /* SHEET */
 async function doSheet() {
   if (!state) return;
+  if (state.character_setup_pending) {
+    modalContent.innerHTML = '<h3>📜 Лист героя</h3><p>Характеристики ещё формируются. Дождитесь обновления листа после первого ответа мастера.</p>' +
+      `<button class="btn primary" onclick="document.getElementById('modal').classList.remove('open')">Закрыть</button>`;
+    modalEl.classList.add('open');
+    return;
+  }
   const s = state.stats || {};
-  const quests = (state.quests || []).map(q => {
+  const quests = (Array.isArray(state.quests) ? state.quests : []).map(q => {
     if (typeof q === 'string') {
       return { id: 'old-' + q, name: q, type: 'side', status: 'active',
                chain: '', chain_order: 0, stages: [], current_stage: 0,
@@ -1232,10 +1334,10 @@ async function doSheet() {
           ? item.name || item.title || 'Предмет'
           : item;
         const count = Number(item?.quantity);
-        return `<span class="tag">${esc(label)}${count > 1 ? ` ×${esc(count)}` : ''}</span>`;
+        return `<span class="tag">${esc(label)}${Number.isInteger(count) && count >= 0 ? ` ×${count}` : ''}</span>`;
       }).join('')
     : '<span class="tag empty">пусто</span>';
-  const cd = (state.conditions || []).length
+  const cd = Array.isArray(state.conditions) && state.conditions.length
     ? state.conditions.map(c => `<span class="tag">${esc(c)}</span>`).join('')
     : '<span class="tag empty">нет</span>';
 
@@ -1246,6 +1348,18 @@ async function doSheet() {
     faction: { icon: '🏛', label: 'Фракция', color: '#7fbf7f' }
   };
 
+  function safeQuestStages(raw) {
+    if (Array.isArray(raw)) return raw.map(st =>
+      typeof st === 'string' ? {text: st, done: false} :
+      (st && typeof st === 'object' ? {text: readableValue(st.text || st.name || st), done: Boolean(st.done)} : null)
+    ).filter(Boolean);
+    if (typeof raw === 'string' && raw.trim()) return [{text: raw, done: false}];
+    if (raw && typeof raw === 'object') return Object.values(raw).map(st =>
+      typeof st === 'string' ? {text: st, done: false} :
+      (st && typeof st === 'object' ? {text: readableValue(st.text || st.name || st), done: Boolean(st.done)} : null)
+    ).filter(Boolean);
+    return [];
+  }
   function renderQuest(q) {
     const t = typeInfo[q.type] || typeInfo.side;
     const isCompleted = q.status === 'completed';
@@ -1253,7 +1367,7 @@ async function doSheet() {
     const offered = q.status === 'offered';
     const statusIcon = isCompleted ? '✓' : (isFailed ? '✗' : '●');
     const statusColor = isCompleted ? '#5a5a4e' : (isFailed ? '#d45a5a' : t.color);
-    const stages = (q.stages || []).map((st, i) => {
+    const stages = safeQuestStages(q.stages).map((st, i) => {
       const mark = st.done ? '✓' : (i === (q.current_stage || 0) ? '▶' : '○');
       const color = st.done ? '#5a5a4e' : (i === (q.current_stage || 0) ? 'var(--text-primary)' : 'var(--text-secondary)');
       const strike = st.done ? 'text-decoration:line-through;' : '';
@@ -1513,6 +1627,8 @@ async function doSkills() {
     ` : ''}
     <h3 style="margin-top:14px;font-size:15px">Активные умения</h3>
     <div>${abilities}</div>
+    <h3 style="margin-top:14px;font-size:15px">Известные заклинания</h3>
+    <div class="tags">${(Array.isArray(state.spells_known) && state.spells_known.length) ? state.spells_known.map(sp => `<span class="tag">${esc(sp)}</span>`).join('') : '<span class="tag empty">список пока не задан</span>'}</div>
     <h3 style="margin-top:14px;font-size:15px">Пассивные навыки</h3>
     <div class="tags">${skills}</div>
     <h3 style="margin-top:14px;font-size:15px">Владения</h3>
@@ -1547,6 +1663,10 @@ function fmtSize(bytes) {
 
 async function doSave(name) {
   if (busy) return;
+  if (stateUpdatePromise) {
+    const wait = addMsg('system', '⏳ Сохранение дождётся обновления листа героя…');
+    try { await stateUpdatePromise; } finally { wait.remove(); }
+  }
   if (!name) {
     name = await promptModal('Название сохранения', 'game-' + Date.now());
     if (!name) return;
@@ -1567,7 +1687,7 @@ async function doSave(name) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const d = await res.json();
-    if (!d.ok) throw new Error(d.error || 'не удалось сохранить');
+    if (!d.ok) throw new Error(readableValue(d.error) || 'не удалось сохранить');
     addMsg('system', `💾 Сохранено: «${d.name}»`);
   } catch(e) { addMsg('system', 'Ошибка сохранения: ' + e.message); }
 }
@@ -1627,7 +1747,7 @@ function savesModal() {
               });
               const d = await r.json().catch(() => ({}));
               note = d.ok ? `Переименовано: «${nm}» → «${nn}»`
-                          : 'Не удалось переименовать: ' + (d.error || ('HTTP ' + r.status));
+                          : 'Не удалось переименовать: ' + (readableValue(d.error) || ('HTTP ' + r.status));
             } catch (err) { note = 'Не удалось переименовать: ' + err.message; }
           } else {
             if (!confirm(`Удалить сохранение «${nm}»?\n\nЭто необратимо.`)) { note = ''; render(); return; }
@@ -1638,7 +1758,7 @@ function savesModal() {
               });
               const d = await r.json().catch(() => ({}));
               note = d.ok ? `Удалено: «${nm}»`
-                          : 'Не удалось удалить: ' + (d.error || ('HTTP ' + r.status));
+                          : 'Не удалось удалить: ' + (readableValue(d.error) || ('HTTP ' + r.status));
             } catch (err) { note = 'Не удалось удалить: ' + err.message; }
           }
           await refresh();
@@ -1654,6 +1774,11 @@ function savesModal() {
 
 async function doLoad(name) {
   if (busy) return;
+  if (stateUpdatePromise) {
+    const notice = addMsg('system', '⏳ Дождитесь сохранения изменений текущего листа перед загрузкой другой партии.');
+    await stateUpdatePromise;
+    notice.remove();
+  }
   if (!name) {
     name = await savesModal();
     if (!name || busy) return;
@@ -1681,6 +1806,10 @@ async function doLoad(name) {
                 инвентарь, заметки, квесты, отношения. */
 
 function doTransfer() {
+  if (stateUpdatePromise) {
+    addMsg('system', '⏳ Дождитесь окончания обновления листа перед переносом партии.');
+    return;
+  }
   const current = JSON.stringify({messages, state});
   const charName = (state && state.name) || 'Пустой';
 
@@ -1822,10 +1951,20 @@ function doHelp() {
 
 function renderAll() {
   chatEl.innerHTML = '';
-  messages.forEach(m => {
-    if (m.role === 'user') {
-      const c = m.content.replace(/^\[\[(БРОСОК|СИСТЕМА)\]\]\s*/, '');
-      addMsg('user', c);
+  messages.forEach((m, index) => {
+    if (m.role === 'dice') {
+      if (m.content && typeof m.content === 'object' && Array.isArray(m.content.rolls)) drawDiceCard(m.content);
+    } else if (m.role === 'user') {
+      if (typeof m.content === 'string' && m.content.startsWith('[[БРОСОК]]')) {
+        // Legacy saves contain no dedicated dice event. Avoid duplicate cards in newer saves.
+        const previous = messages[index - 1];
+        if (previous?.role !== 'dice') {
+          const clean = m.content.replace(/^\[\[БРОСОК\]\]\s*/, '').split('. Используй этот итог.')[0];
+          addMsg('dice', '🎲 ' + clean);
+        }
+      } else {
+        addMsg('user', readableValue(m.content).replace(/^\[\[СИСТЕМА\]\]\s*/, ''));
+      }
     } else if (m.role === 'assistant') {
       addMsg('master', m.content);
     }
