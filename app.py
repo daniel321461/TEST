@@ -26,7 +26,7 @@ from openai import OpenAI
 from token_usage import TokenUsage, state_turn_id
 
 BASE_DIR = Path(__file__).resolve().parent
-APP_REVISION = "2026-11-25.20-qa"
+APP_REVISION = "2026-11-25.21-stability"
 QWEN_SUMMARY_LIMIT = 480
 QWEN_STATE_LIMIT = 1100
 QWEN_STATE_SETUP_LIMIT = 2200
@@ -397,7 +397,7 @@ CHARACTER_CREATION_RULES = """
 3. ХАРАКТЕРИСТИКИ (базовые по классу + расовые бонусы).
 4. ВЛАДЕНИЯ, НАВЫКИ, УМЕНИЯ.
 
-Объяви итог: «Кейр, эльф-плут, Преступник. Ловкость 17 (+2 эльф)... HP 10/10. Владения: ... Навыки: ... Умения: ...»
+Имя персонажа берётся ТОЛЬКО из выбранного игроком имени в [ЛИСТЕ]. Никогда не придумывай другое имя, не подставляй имя из примеров и не переименовывай героя. В первом ответе назови его дословно так, как указано в [ЛИСТЕ]. Далее объяви расу, класс, предысторию, характеристики и умения, после чего начни сцену.
 
 ════════ БАЗОВЫЕ ХАРАКТЕРИСТИКИ ════════
 • Воин/Варвар/Паладин: Сила 15, Тел 14
@@ -1219,6 +1219,12 @@ def extract_state(messages, current_state, turn_id=None):
         merged["last_state_event_id"] = last_event_id
     merged["xp"] = xp
     merged["xp_event_ids"] = processed
+    # The builder's identity belongs to the player, not the language model.
+    # The model may refer to the hero under a mistaken name, but may not rename the save.
+    for identity_field in ("name", "race", "class", "background"):
+        selected = current.get(identity_field)
+        if isinstance(selected, str) and selected.strip() and selected != "Пустой":
+            merged[identity_field] = selected
     # Protect core scalar values from blank/null model output.
     for f in ("name", "race", "class", "background", "position"):
         if not merged.get(f) and current.get(f):
@@ -1423,6 +1429,15 @@ def api_chat():
     if not messages:
         return jsonify({"error": "empty dialogue"}), 400
     prompt = SYSTEM_PROMPT
+    # Client-selected identity is authoritative; no illustrative names should override it.
+    identity = {key: game_state.get(key) for key in ("name", "race", "class", "background")
+                if isinstance(game_state.get(key), str) and game_state[key].strip()}
+    if identity.get("name") and identity["name"] != "Пустой":
+        prompt += ("\nВАЖНО: имя игрового героя утверждено игроком: "
+                   + json.dumps(identity["name"], ensure_ascii=False)
+                   + ". Обращайся только этим именем, не выдумывай и не заменяй его."
+                   + " Остальные утверждённые поля: "
+                   + json.dumps(identity, ensure_ascii=False) + ".\n")
     if game_state.get("character_setup_pending") or not (game_state.get("race") and game_state.get("class")):
         prompt += CHARACTER_CREATION_RULES
     messages = [{"role": "system", "content": prompt}] + messages
